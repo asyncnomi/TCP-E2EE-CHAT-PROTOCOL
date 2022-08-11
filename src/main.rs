@@ -12,7 +12,7 @@ use hex;
 use lz4_flex::{compress_prepend_size, decompress_size_prepended};
 
 const PYLD_LENGTH: usize = 512; // 512 octects
-const OAEP_PAD: usize = 98; // i.e sha384
+const OAEP_PAD: usize = 98; // i.e 4096 key length and sha384
 const NAME_LENGTH: usize = 112; // e.g 28 unicode char
 const PWD_LENGTH: usize = 128; // e.g 32 unicode char
 const TOKEN_LENGTH: usize = 8; // 18x10^18
@@ -75,6 +75,9 @@ fn handle_client(mut stream: TcpStream, online_users: Arc<Mutex<Vec<User>>>, cur
         Ok(_size) => {
             /*
                 99 -> Unauthorized
+                96 -> Clean client disconnection
+                95 -> Tcp error while reading buffer (or unexpected client disconnection)
+                94 -> Payload incorrectly formatted
             */
             if !secured {
                 match &data[0] {
@@ -136,6 +139,8 @@ fn handle_client(mut stream: TcpStream, online_users: Arc<Mutex<Vec<User>>>, cur
                         break 'main;
                     }
                 };
+                // Payload are now padded by the RSA encyption, thus the length must be check
+                let size = data.len();
                 match data[0] {
                     8 => {
                         // Login
@@ -143,6 +148,10 @@ fn handle_client(mut stream: TcpStream, online_users: Arc<Mutex<Vec<User>>>, cur
                             81 -> login failed
                             82 -> Successfully logged in
                         */
+                        if size != 1+NAME_LENGTH+PWD_LENGTH {
+                            kill_stream(&mut stream, &client_public_key, &online_users, session_id, 94);
+                            break 'main;
+                        }
                         if id == -1 {
                             let login = hex::encode(&data[1..1+NAME_LENGTH]);
                             let password = &data[1+NAME_LENGTH..1+NAME_LENGTH+PWD_LENGTH];
@@ -201,6 +210,10 @@ fn handle_client(mut stream: TcpStream, online_users: Arc<Mutex<Vec<User>>>, cur
                             91 -> login name already exists
                             92 -> Account successfully created and login
                         */
+                        if size != 1+NAME_LENGTH+PWD_LENGTH {
+                            kill_stream(&mut stream, &client_public_key, &online_users, session_id, 94);
+                            break 'main;
+                        }
                         if id == -1 {
                             let login = hex::encode(&data[1..1+NAME_LENGTH]);
                             let password = &data[1+NAME_LENGTH..1+NAME_LENGTH+PWD_LENGTH];
@@ -250,6 +263,10 @@ fn handle_client(mut stream: TcpStream, online_users: Arc<Mutex<Vec<User>>>, cur
                     },
                     _ => {
                         // The original stream can no longer be used as a writer since it is cloned in the mutex and can be used by other threads (writing only)
+                        if size < 1+TOKEN_LENGTH {
+                            kill_stream(&mut stream, &client_public_key, &online_users, session_id, 94);
+                            break 'main;
+                        }
                         if id != -1 && token == data[1..1+TOKEN_LENGTH] {
                             match &data[0] {
                                 11 | 12 => {
@@ -264,6 +281,11 @@ fn handle_client(mut stream: TcpStream, online_users: Arc<Mutex<Vec<User>>>, cur
                                         The binding is check for each new message but not for each part of it
                                         If two partial msg are send with differents recipient the buffer is wiped and the binding is check for the new user
                                     */
+                                    // Msg must be manually padded by the client, since users input length is non constant
+                                    if size != PYLD_LENGTH-OAEP_PAD {
+                                        kill_stream(&mut stream, &client_public_key, &online_users, session_id, 94);
+                                        break 'main;
+                                    }
                                     let name = hex::encode(&data[1+TOKEN_LENGTH..1+TOKEN_LENGTH+NAME_LENGTH]);
                                     if allow_id == -1 || allow_name != name {
                                         msg_buf = Vec::new();
@@ -343,6 +365,10 @@ fn handle_client(mut stream: TcpStream, online_users: Arc<Mutex<Vec<User>>>, cur
                                         T:2 -> incoming request
                                         T:3 -> Both
                                     */
+                                    if size != 1+TOKEN_LENGTH {
+                                        kill_stream(&mut stream, &client_public_key, &online_users, session_id, 94);
+                                        break 'main;
+                                    }
                                     let mut buf: Vec<u8> = Vec::new();
                                     let mut outgoing: Vec<String> = Vec::new();
                                     let mut incoming: Vec<String> = Vec::new();
@@ -412,6 +438,10 @@ fn handle_client(mut stream: TcpStream, online_users: Arc<Mutex<Vec<User>>>, cur
                                         222 -> Failed (already exist)
                                         223 -> Failed (not found)
                                     */
+                                    if size != 1+TOKEN_LENGTH+NAME_LENGTH {
+                                        kill_stream(&mut stream, &client_public_key, &online_users, session_id, 94);
+                                        break 'main;
+                                    }
                                     let name = hex::encode(&data[1+TOKEN_LENGTH..1+TOKEN_LENGTH+NAME_LENGTH]);
                                     let mut stmt = conn.prepare("SELECT id FROM users WHERE login = ?").unwrap();
                                     let mut rows = stmt.query([&name]).unwrap();
@@ -420,27 +450,34 @@ fn handle_client(mut stream: TcpStream, online_users: Arc<Mutex<Vec<User>>>, cur
                                         ids.push(row.get(0).unwrap());
                                     }
                                     if ids.len() == 1 {
-                                        let mut stmt = conn.prepare("SELECT id FROM bindings WHERE (id_emitter, id_receiver) = (?, ?)").unwrap();
-                                        let mut rows = stmt.query([&id, &ids[0]]).unwrap();
-                                        let mut ids_bind: Vec<i32> = Vec::new();
-                                        while let Some(row) = rows.next().unwrap() {
-                                            ids_bind.push(row.get(0).unwrap());
-                                        }
-                                        if ids_bind.len() == 0 {
-                                            let mut stmt = conn.prepare("INSERT INTO bindings (id_emitter, id_receiver, tmp_key) VALUES (?, ?, '0')").unwrap();
-                                            stmt.execute((&id, ids[0])).unwrap();
-                                            match stream_push(cipher(&client_public_key, &[221]), &online_users, session_id) {
-                                                Ok(_) => (),
-                                                Err(err) => tcp_error(err)
+                                        if ids[0] != id {
+                                            let mut stmt = conn.prepare("SELECT id FROM bindings WHERE (id_emitter, id_receiver) = (?, ?)").unwrap();
+                                            let mut rows = stmt.query([&id, &ids[0]]).unwrap();
+                                            let mut ids_bind: Vec<i32> = Vec::new();
+                                            while let Some(row) = rows.next().unwrap() {
+                                                ids_bind.push(row.get(0).unwrap());
+                                            }
+                                            if ids_bind.len() == 0 {
+                                                let mut stmt = conn.prepare("INSERT INTO bindings (id_emitter, id_receiver, tmp_key) VALUES (?, ?, '0')").unwrap();
+                                                stmt.execute((&id, ids[0])).unwrap();
+                                                match stream_push(cipher(&client_public_key, &[221]), &online_users, session_id) {
+                                                    Ok(_) => (),
+                                                    Err(err) => tcp_error(err)
+                                                }
+                                            } else {
+                                                match stream_push(cipher(&client_public_key, &[222]), &online_users, session_id) {
+                                                    Ok(_) => (),
+                                                    Err(err) => tcp_error(err)
+                                                }
                                             }
                                         } else {
-                                            match stream_push(cipher(&client_public_key, &[222]), &online_users, session_id) {
+                                            match stream_push(cipher(&client_public_key, &[223]), &online_users, session_id) {
                                                 Ok(_) => (),
                                                 Err(err) => tcp_error(err)
                                             }
                                         }
                                     } else {
-                                        match stream_push(cipher(&client_public_key, &[223]), &online_users, session_id) {
+                                        match stream_push(cipher(&client_public_key, &[224]), &online_users, session_id) {
                                             Ok(_) => (),
                                             Err(err) => tcp_error(err)
                                         }
@@ -452,6 +489,10 @@ fn handle_client(mut stream: TcpStream, online_users: Arc<Mutex<Vec<User>>>, cur
                                         211 -> Success
                                         212 -> Failed (not found)
                                     */
+                                    if size != 1+TOKEN_LENGTH+NAME_LENGTH {
+                                        kill_stream(&mut stream, &client_public_key, &online_users, session_id, 94);
+                                        break 'main;
+                                    }
                                     let name = hex::encode(&data[1+TOKEN_LENGTH..1+TOKEN_LENGTH+NAME_LENGTH]);
                                     let mut stmt = conn.prepare("SELECT id FROM users WHERE login = ?").unwrap();
                                     let mut rows = stmt.query([&name]).unwrap();
@@ -494,6 +535,10 @@ fn handle_client(mut stream: TcpStream, online_users: Arc<Mutex<Vec<User>>>, cur
                                         T:0 -> emit
                                         T:1 -> receive
                                     */
+                                    if size != 1+TOKEN_LENGTH+NAME_LENGTH+1 {
+                                        kill_stream(&mut stream, &client_public_key, &online_users, session_id, 94);
+                                        break 'main;
+                                    }
                                     let name = hex::encode(&data[1+TOKEN_LENGTH..1+TOKEN_LENGTH+NAME_LENGTH]);
                                     let x = data[1+TOKEN_LENGTH+NAME_LENGTH];
                                     let mut stmt = conn.prepare("SELECT id FROM users WHERE login = ?").unwrap();
@@ -578,6 +623,10 @@ fn handle_client(mut stream: TcpStream, online_users: Arc<Mutex<Vec<User>>>, cur
                                     /*
                                         96 -> Stream close
                                     */
+                                    if size != 1+TOKEN_LENGTH {
+                                        kill_stream(&mut stream, &client_public_key, &online_users, session_id, 94);
+                                        break 'main;
+                                    }
                                     println!("Terminating connection with {}", stream.peer_addr().unwrap());
                                     kill_stream(&mut stream, &client_public_key, &online_users, session_id, 96);
                                     break 'main;
@@ -587,6 +636,10 @@ fn handle_client(mut stream: TcpStream, online_users: Arc<Mutex<Vec<User>>>, cur
                                 },
                                 98 => {
                                     // Ping-Pong or event fire
+                                    if size != 1+TOKEN_LENGTH {
+                                        kill_stream(&mut stream, &client_public_key, &online_users, session_id, 94);
+                                        break 'main;
+                                    }
                                     match stream_push(cipher(&client_public_key, &[98]), &online_users, session_id) {
                                         Ok(_) => (),
                                         Err(err) => tcp_error(err)
@@ -682,6 +735,7 @@ fn kill_stream(stream: &mut TcpStream, client_public_key: &RsaPublicKey, online_
     let mut online = online_users.lock().unwrap();
     online.retain(|user| user.session_id != session_id);
     stream.shutdown(Shutdown::Both).unwrap();
+    println!("Stream killed for user: {}", stream.peer_addr().unwrap());
 }
 
 fn tcp_error(err: std::io::Error) {
